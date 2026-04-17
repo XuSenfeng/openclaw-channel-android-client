@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 使用 AppCompat 基础主题，这在几乎所有配置中都是可用的 -->
+    <style name="Theme.OpenClawClient" parent="Theme.AppCompat.Light.NoActionBar">
+    </style>
+</resources>
