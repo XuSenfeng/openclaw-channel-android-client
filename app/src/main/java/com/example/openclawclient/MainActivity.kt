@@ -39,6 +39,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -236,6 +237,7 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
     var reconnectEnabled by remember { mutableStateOf(true) }
     var reconnectJob by remember { mutableStateOf<Job?>(null) }
     var historyLoaded by remember { mutableStateOf(false) }
+    val activeStreamMessageIds = remember { mutableStateMapOf<String, String>() }
     var connectSocket: () -> Unit = {}
 
     fun persistKnownChats() {
@@ -414,6 +416,63 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                                             ),
                                         )
                                         lastProcessedMsgId = messageId
+                                    }
+
+                                    "bot_message_stream" -> {
+                                        val userId = responseMap["user_id"] as? String
+                                        if (userId != DEFAULT_USER_ID) {
+                                            return@launch
+                                        }
+
+                                        val state = (responseMap["state"] as? String)?.trim()?.lowercase()
+                                        val chatId = (responseMap["chat_id"] as? String).orEmpty()
+                                        if (chatId.isBlank()) {
+                                            return@launch
+                                        }
+
+                                        val streamId = (responseMap["stream_id"] as? String)
+                                            ?.takeIf { it.isNotBlank() }
+                                            ?: return@launch
+                                        val streamKey = "$chatId::$streamId"
+                                        val messageId = (responseMap["message_id"] as? String)
+                                            ?.takeIf { it.isNotBlank() }
+                                            ?: streamId
+                                        val clientMessageId = responseMap["client_message_id"] as? String
+
+                                        when (state) {
+                                            "delta" -> {
+                                                val streamMessageId = activeStreamMessageIds[streamKey] ?: messageId
+                                                activeStreamMessageIds[streamKey] = streamMessageId
+                                                val content = (responseMap["content"] as? String)
+                                                    ?: (responseMap["delta"] as? String)
+                                                    ?: ""
+                                                mergeIncomingMessage(
+                                                    chatId,
+                                                    ChatMessage(
+                                                        content = content,
+                                                        fromUser = false,
+                                                        id = streamMessageId,
+                                                        clientMessageId = clientMessageId,
+                                                    ),
+                                                )
+                                            }
+
+                                            "final" -> {
+                                                val finalMessageId = activeStreamMessageIds[streamKey] ?: messageId
+                                                val content = (responseMap["content"] as? String) ?: ""
+                                                mergeIncomingMessage(
+                                                    chatId,
+                                                    ChatMessage(
+                                                        content = content,
+                                                        fromUser = false,
+                                                        id = finalMessageId,
+                                                        clientMessageId = clientMessageId,
+                                                    ),
+                                                )
+                                                activeStreamMessageIds.remove(streamKey)
+                                                lastProcessedMsgId = finalMessageId
+                                            }
+                                        }
                                     }
 
                                     "get_messages_response" -> {
