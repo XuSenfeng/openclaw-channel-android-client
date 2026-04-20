@@ -86,6 +86,8 @@ import java.util.Locale
 import java.util.UUID
 
 private const val DEFAULT_USER_ID = "user001"
+private const val DEFAULT_SERVER_ID = "default"
+private const val DEFAULT_WS_URL = "ws://192.168.0.8:8765"
 private const val DEFAULT_CHAT_ID = "default_chat"
 private const val PREFS_NAME = "openclaw_client_state"
 private const val ACTIVE_CHAT_PREFIX = "active_chat_"
@@ -99,6 +101,37 @@ private val tableSeparatorRegex = Regex("^\\s*\\|?(\\s*:?[-]{3,}:?\\s*\\|)+\\s*:
 private val horizontalRuleRegex = Regex("^\\s*([-*_])\\1{2,}\\s*$")
 
 private val persistenceGson = Gson()
+
+data class ClientSettings(
+    val wsUrl: String,
+    val serverId: String,
+    val userId: String,
+)
+
+object ClientSettingsStore {
+    private const val KEY_WS_URL = "settings_ws_url"
+    private const val KEY_SERVER_ID = "settings_server_id"
+    private const val KEY_USER_ID = "settings_user_id"
+
+    private fun prefs(context: Context) = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    fun load(context: Context): ClientSettings {
+        val store = prefs(context)
+        return ClientSettings(
+            wsUrl = store.getString(KEY_WS_URL, DEFAULT_WS_URL)?.trim().orEmpty().ifBlank { DEFAULT_WS_URL },
+            serverId = store.getString(KEY_SERVER_ID, DEFAULT_SERVER_ID)?.trim().orEmpty().ifBlank { DEFAULT_SERVER_ID },
+            userId = store.getString(KEY_USER_ID, DEFAULT_USER_ID)?.trim().orEmpty().ifBlank { DEFAULT_USER_ID },
+        )
+    }
+
+    fun save(context: Context, settings: ClientSettings) {
+        prefs(context).edit()
+            .putString(KEY_WS_URL, settings.wsUrl)
+            .putString(KEY_SERVER_ID, settings.serverId)
+            .putString(KEY_USER_ID, settings.userId)
+            .apply()
+    }
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -213,8 +246,6 @@ private class AndroidSpeechInput(
             return
         }
         Log.d(TAG, "startListening: launching SpeechRecognizer")
-        activeRecognizer.stopListening()
-        activeRecognizer.cancel()
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
@@ -246,7 +277,7 @@ private class AndroidSpeechInput(
     override fun onError(error: Int) {
         val message = when (error) {
             SpeechRecognizer.ERROR_AUDIO -> "语音输入失败：音频录制错误"
-            SpeechRecognizer.ERROR_CLIENT -> "语音输入失败：客户端错误"
+            SpeechRecognizer.ERROR_CLIENT -> "语音输入失败：客户端错误，请重试"
             SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "语音输入失败：缺少麦克风权限"
             SpeechRecognizer.ERROR_NETWORK -> "语音输入失败：网络不可用"
             SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "语音输入失败：网络超时"
@@ -489,22 +520,42 @@ private object ChatHistoryStore {
 
 @Composable
 fun AppNavigation() {
+    val context = LocalContext.current
     val navController = rememberNavController()
-    var wsUrl by rememberSaveable { mutableStateOf("ws://192.168.0.8:8765") }
+    val initialSettings = remember(context) { ClientSettingsStore.load(context) }
+    var wsUrl by rememberSaveable { mutableStateOf(initialSettings.wsUrl) }
+    var serverId by rememberSaveable { mutableStateOf(initialSettings.serverId) }
+    var userId by rememberSaveable { mutableStateOf(initialSettings.userId) }
 
     NavHost(navController = navController, startDestination = "chat") {
         composable("chat") {
-            ChatScreen(wsUrl = wsUrl, onSettingsClick = { navController.navigate("settings") })
+            ChatScreen(
+                wsUrl = wsUrl,
+                serverId = serverId,
+                userId = userId,
+                onSettingsClick = { navController.navigate("settings") },
+            )
         }
         composable("settings") {
-            SettingsScreen(wsUrl = wsUrl, onUrlChange = { wsUrl = it }, onBack = { navController.popBackStack() })
+            SettingsScreen(
+                wsUrl = wsUrl,
+                serverId = serverId,
+                userId = userId,
+                onSave = { next ->
+                    wsUrl = next.wsUrl
+                    serverId = next.serverId
+                    userId = next.userId
+                    ClientSettingsStore.save(context, next)
+                },
+                onBack = { navController.popBackStack() },
+            )
         }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
+fun ChatScreen(wsUrl: String, serverId: String, userId: String, onSettingsClick: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val gson = remember { Gson() }
@@ -583,6 +634,7 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
     var connectionToken by remember { mutableIntStateOf(0) }
     var reconnectEnabled by remember { mutableStateOf(true) }
     var reconnectJob by remember { mutableStateOf<Job?>(null) }
+    var paired by remember { mutableStateOf(false) }
     var historyLoaded by remember { mutableStateOf(false) }
     var speechEnabled by rememberSaveable { mutableStateOf(true) }
     val activeStreamMessageIds = remember { mutableStateMapOf<String, String>() }
@@ -615,6 +667,16 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                 return
             } catch (_: Exception) {
                 Log.e(TAG, "startVoiceInput: SpeechRecognizer threw exception")
+                if (isSpeechRecognitionIntentAvailable(context)) {
+                    try {
+                        voiceInputLauncher.launch(createSpeechRecognitionIntent(context))
+                        connectionStatus = "语音识别器异常，已切换系统语音识别"
+                        return
+                    } catch (_: Exception) {
+                        connectionStatus = "语音输入不可用：无法打开系统语音识别界面"
+                        return
+                    }
+                }
                 connectionStatus = "语音输入不可用：语音识别服务未响应"
                 return
             }
@@ -655,6 +717,10 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
     fun sendUserMessage(text: String): Boolean {
         val currentClient = client
         val trimmed = text.trim()
+        if (!paired) {
+            connectionStatus = "尚未与 OpenClaw 配对成功"
+            return false
+        }
         if (trimmed.isBlank() || currentClient?.isOpen != true) {
             return false
         }
@@ -671,7 +737,8 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
 
         val outgoing = mapOf(
             "type" to "simulate_user_message",
-            "user_id" to DEFAULT_USER_ID,
+            "server_id" to serverId,
+            "user_id" to userId,
             "chat_id" to activeChatId,
             "client_message_id" to clientMessageId,
             "content" to trimmed,
@@ -724,7 +791,7 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                         gson.toJson(
                             mapOf(
                                 "type" to "get_messages",
-                                "user_id" to DEFAULT_USER_ID,
+                                "user_id" to userId,
                                 "chat_id" to normalized,
                             ),
                         ),
@@ -773,7 +840,7 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                     gson.toJson(
                         mapOf(
                             "type" to "get_messages",
-                            "user_id" to DEFAULT_USER_ID,
+                            "user_id" to userId,
                             "chat_id" to chatId,
                         ),
                     ),
@@ -830,6 +897,29 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                                     gson.fromJson(messageJson, Map::class.java) as? Map<*, *>
                                         ?: return@launch
                                 when (responseMap["type"] as? String) {
+                                    "register_response" -> {
+                                        val ok = (responseMap["status"] as? String) == "success"
+                                        val isPaired = responseMap["paired"] as? Boolean ?: false
+                                        if (ok) {
+                                            paired = isPaired
+                                            connectionStatus = if (isPaired) {
+                                                "已连接(配对成功)"
+                                            } else {
+                                                "已连接(等待配对)"
+                                            }
+                                            if (isPaired) {
+                                                requestHistory(activeChatId)
+                                            }
+                                        }
+                                    }
+
+                                    "error" -> {
+                                        val errMsg = responseMap["error"] as? String
+                                        if (!errMsg.isNullOrBlank()) {
+                                            connectionStatus = "错误: $errMsg"
+                                        }
+                                    }
+
                                     "start_new_conversation", "start_new_conversation_response" -> {
                                         val chatId = responseMap["chat_id"] as? String
                                         if (!chatId.isNullOrBlank()) {
@@ -858,8 +948,8 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                                     }
 
                                     "bot_message" -> {
-                                        val userId = responseMap["user_id"] as? String
-                                        if (userId != DEFAULT_USER_ID) {
+                                        val remoteUserId = responseMap["user_id"] as? String
+                                        if (remoteUserId != userId) {
                                             return@launch
                                         }
                                         val chatId = responseMap["chat_id"] as? String
@@ -887,8 +977,8 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                                     }
 
                                     "bot_message_stream" -> {
-                                        val userId = responseMap["user_id"] as? String
-                                        if (userId != DEFAULT_USER_ID) {
+                                        val remoteUserId = responseMap["user_id"] as? String
+                                        if (remoteUserId != userId) {
                                             return@launch
                                         }
 
@@ -982,8 +1072,23 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                         scope.launch {
                             reconnectAttempt = 0
                             reconnectEnabled = true
-                            connectionStatus = "已连接"
-                            requestHistory(activeChatId)
+                            paired = false
+                            connectionStatus = "已连接，注册中..."
+                            val registerPayload = gson.toJson(
+                                mapOf(
+                                    "type" to "register",
+                                    "role" to "client",
+                                    "server_id" to serverId,
+                                    "user_id" to userId,
+                                ),
+                            )
+                            scope.launch(Dispatchers.IO) {
+                                try {
+                                    client?.send(registerPayload)
+                                } catch (e: Exception) {
+                                    e.printStackTrace()
+                                }
+                            }
                         }
                     }
                 },
@@ -991,6 +1096,7 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                     if (token == connectionToken) {
                         scope.launch {
                             client = null
+                            paired = false
                             connectionStatus = "已断开(code=$code)"
                             scheduleReconnect()
                         }
@@ -999,6 +1105,7 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                 onErrorCallback = { _ ->
                     if (token == connectionToken) {
                         scope.launch {
+                            paired = false
                             connectionStatus = "连接错误"
                             scheduleReconnect()
                         }
@@ -1023,9 +1130,10 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
         }
     }
 
-    LaunchedEffect(wsUrl) {
+    LaunchedEffect(wsUrl, serverId, userId) {
         reconnectEnabled = true
         reconnectAttempt = 0
+        paired = false
         historyLoaded = false
         val savedActiveChatId = ChatHistoryStore.loadActiveChatId(context, wsUrl)
         val savedKnownChatIds = ChatHistoryStore.loadKnownChatIds(context, wsUrl)
@@ -1088,6 +1196,13 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                 style = MaterialTheme.typography.bodyMedium,
             )
             Text(
+                text = "目标: $serverId / $userId",
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 2.dp),
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Text(
                 text = "当前会话: $activeChatId",
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1128,6 +1243,10 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                 Spacer(modifier = Modifier.width(8.dp))
                 OutlinedButton(
                     onClick = {
+                        if (!paired) {
+                            connectionStatus = "尚未与 OpenClaw 配对成功"
+                            return@OutlinedButton
+                        }
                         if (client?.isOpen == true) {
                             scope.launch(Dispatchers.IO) {
                                 try {
@@ -1135,7 +1254,8 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                                         gson.toJson(
                                             mapOf(
                                                 "type" to "start_new_conversation",
-                                                "user_id" to DEFAULT_USER_ID,
+                                                "server_id" to serverId,
+                                                "user_id" to userId,
                                             ),
                                         ),
                                     )
@@ -1597,8 +1717,16 @@ private fun appendInlineMarkdown(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsScreen(wsUrl: String, onUrlChange: (String) -> Unit, onBack: () -> Unit) {
+fun SettingsScreen(
+    wsUrl: String,
+    serverId: String,
+    userId: String,
+    onSave: (ClientSettings) -> Unit,
+    onBack: () -> Unit,
+) {
     var tempUrl by remember { mutableStateOf(wsUrl) }
+    var tempServerId by remember { mutableStateOf(serverId) }
+    var tempUserId by remember { mutableStateOf(userId) }
 
     Scaffold(
         topBar = {
@@ -1613,9 +1741,29 @@ fun SettingsScreen(wsUrl: String, onUrlChange: (String) -> Unit, onBack: () -> U
                 modifier = Modifier.fillMaxWidth(),
             )
             Spacer(modifier = Modifier.height(16.dp))
+            TextField(
+                value = tempServerId,
+                onValueChange = { tempServerId = it },
+                label = { Text("Server ID") },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            TextField(
+                value = tempUserId,
+                onValueChange = { tempUserId = it },
+                label = { Text("User ID") },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(modifier = Modifier.height(16.dp))
             Button(
                 onClick = {
-                    onUrlChange(tempUrl)
+                    onSave(
+                        ClientSettings(
+                            wsUrl = tempUrl.trim().ifBlank { DEFAULT_WS_URL },
+                            serverId = tempServerId.trim().ifBlank { DEFAULT_SERVER_ID },
+                            userId = tempUserId.trim().ifBlank { DEFAULT_USER_ID },
+                        ),
+                    )
                     onBack()
                 },
                 modifier = Modifier.fillMaxWidth(),
