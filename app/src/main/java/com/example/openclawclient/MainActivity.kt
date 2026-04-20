@@ -1,9 +1,23 @@
 package com.example.openclawclient
 
+import android.Manifest
+import android.app.Activity
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
+import android.provider.Settings
+import android.speech.RecognizerIntent
+import android.speech.RecognitionListener
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.result.contract.ActivityResultContracts.RequestPermission
+import androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -13,6 +27,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -58,6 +73,7 @@ import androidx.compose.ui.unit.dp
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import androidx.core.content.ContextCompat
 import com.google.gson.Gson
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -66,6 +82,7 @@ import kotlinx.coroutines.launch
 import org.java_websocket.client.WebSocketClient
 import org.java_websocket.handshake.ServerHandshake
 import java.net.URI
+import java.util.Locale
 import java.util.UUID
 
 private const val DEFAULT_USER_ID = "user001"
@@ -76,6 +93,7 @@ private const val CHAT_HISTORY_PREFIX = "chat_history_"
 private const val KNOWN_CHAT_IDS_PREFIX = "known_chat_ids_"
 private const val INITIAL_RECONNECT_DELAY_MS = 500L
 private const val MAX_RECONNECT_DELAY_MS = 5_000L
+private const val TAG = "OpenClawVoice"
 private val fencedCodeRegex = Regex("(?s)```(?:[A-Za-z0-9_+-]+)?\\n(.*?)```")
 private val tableSeparatorRegex = Regex("^\\s*\\|?(\\s*:?[-]{3,}:?\\s*\\|)+\\s*:?[-]{3,}:?\\s*\\|?\\s*$")
 private val horizontalRuleRegex = Regex("^\\s*([-*_])\\1{2,}\\s*$")
@@ -99,6 +117,238 @@ data class ChatMessage(
     val timestamp: Long = System.currentTimeMillis(),
 )
 
+private class AndroidTtsSpeaker(context: Context) : TextToSpeech.OnInitListener {
+    private val appContext = context.applicationContext
+    @Volatile
+    private var engine: TextToSpeech? = TextToSpeech(appContext, this)
+    @Volatile
+    private var ready = false
+    @Volatile
+    private var pendingText: String? = null
+    @Volatile
+    private var pendingUtteranceId: String? = null
+
+    override fun onInit(status: Int) {
+        val tts = engine ?: return
+        ready = status == TextToSpeech.SUCCESS
+        if (!ready) {
+            pendingText = null
+            pendingUtteranceId = null
+            return
+        }
+
+        val locale = Locale.getDefault()
+        val localeState = tts.setLanguage(locale)
+        if (localeState == TextToSpeech.LANG_MISSING_DATA || localeState == TextToSpeech.LANG_NOT_SUPPORTED) {
+            val fallbackState = tts.setLanguage(Locale.US)
+            ready = fallbackState != TextToSpeech.LANG_MISSING_DATA && fallbackState != TextToSpeech.LANG_NOT_SUPPORTED
+        }
+
+        val text = pendingText
+        val utteranceId = pendingUtteranceId
+        pendingText = null
+        pendingUtteranceId = null
+        if (ready && !text.isNullOrBlank() && !utteranceId.isNullOrBlank()) {
+            speakInternal(text, utteranceId)
+        }
+    }
+
+    fun speak(text: String) {
+        val cleaned = cleanForSpeech(text)
+        if (cleaned.isBlank()) {
+            return
+        }
+
+        val utteranceId = UUID.randomUUID().toString()
+        if (!ready) {
+            pendingText = cleaned
+            pendingUtteranceId = utteranceId
+            return
+        }
+
+        speakInternal(cleaned, utteranceId)
+    }
+
+    private fun speakInternal(text: String, utteranceId: String) {
+        val tts = engine ?: return
+        tts.stop()
+        tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+    }
+
+    fun shutdown() {
+        pendingText = null
+        pendingUtteranceId = null
+        ready = false
+        engine?.stop()
+        engine?.shutdown()
+        engine = null
+    }
+}
+
+private class AndroidSpeechInput(
+    private val context: Context,
+    private val onPartialText: (String) -> Unit,
+    private val onFinalText: (String) -> Unit,
+    private val onError: (String) -> Unit,
+) : RecognitionListener {
+    private val recognizer: SpeechRecognizer? = if (SpeechRecognizer.isRecognitionAvailable(context)) {
+        SpeechRecognizer.createSpeechRecognizer(context)
+    } else {
+        Log.e(TAG, "SpeechRecognizer unavailable: isRecognitionAvailable=false")
+        null
+    }
+
+    init {
+        recognizer?.setRecognitionListener(this)
+    }
+
+    fun isAvailable(): Boolean {
+        return recognizer != null
+    }
+
+    fun startListening() {
+        val activeRecognizer = recognizer ?: run {
+            Log.e(TAG, "startListening aborted: recognizer is null")
+            onError("语音输入不可用：请安装语音识别服务")
+            return
+        }
+        Log.d(TAG, "startListening: launching SpeechRecognizer")
+        activeRecognizer.stopListening()
+        activeRecognizer.cancel()
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
+        }
+        try {
+            activeRecognizer.startListening(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "startListening failed", e)
+            onError("语音输入不可用：语音识别服务未响应")
+        }
+    }
+
+    fun stop() {
+        recognizer?.destroy()
+    }
+
+    override fun onReadyForSpeech(params: Bundle?) = Unit
+
+    override fun onBeginningOfSpeech() = Unit
+
+    override fun onRmsChanged(rmsdB: Float) = Unit
+
+    override fun onBufferReceived(buffer: ByteArray?) = Unit
+
+    override fun onEndOfSpeech() = Unit
+
+    override fun onError(error: Int) {
+        val message = when (error) {
+            SpeechRecognizer.ERROR_AUDIO -> "语音输入失败：音频录制错误"
+            SpeechRecognizer.ERROR_CLIENT -> "语音输入失败：客户端错误"
+            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "语音输入失败：缺少麦克风权限"
+            SpeechRecognizer.ERROR_NETWORK -> "语音输入失败：网络不可用"
+            SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "语音输入失败：网络超时"
+            SpeechRecognizer.ERROR_NO_MATCH -> "语音输入失败：没有识别到内容"
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "语音输入失败：识别器忙"
+            SpeechRecognizer.ERROR_SERVER -> "语音输入失败：识别服务异常"
+            else -> "语音输入失败：错误码 $error"
+        }
+        Log.e(TAG, "SpeechRecognizer onError=$error message=$message")
+        onError(message)
+    }
+
+    override fun onResults(results: Bundle?) {
+        val transcript = results
+            ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            ?.firstOrNull()
+            ?.trim()
+            .orEmpty()
+        if (transcript.isNotBlank()) {
+            Log.d(TAG, "onResults transcript=$transcript")
+            onFinalText(transcript)
+        } else {
+            Log.w(TAG, "onResults returned empty transcript")
+        }
+    }
+
+    override fun onPartialResults(partialResults: Bundle?) {
+        val transcript = partialResults
+            ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            ?.firstOrNull()
+            ?.trim()
+            .orEmpty()
+        if (transcript.isNotBlank()) {
+            Log.d(TAG, "onPartialResults transcript=$transcript")
+            onPartialText(transcript)
+        }
+    }
+
+    override fun onEvent(eventType: Int, params: Bundle?) = Unit
+}
+
+private fun cleanForSpeech(text: String): String {
+    return text
+        .replace(Regex("```[\\s\\S]*?```"), " ")
+        .replace(Regex("`[^`]+`"), " ")
+        .replace(Regex("!\\[.*?\\]\\(.*?\\)"), " ")
+        .replace(Regex("\\[([^\\]]+)\\]\\(.*?\\)"), "$1")
+        .replace(Regex("^#{1,6}\\s+", RegexOption.MULTILINE), "")
+        .replace(Regex("\\*{1,3}(.*?)\\*{1,3}"), "$1")
+        .replace(Regex("_{1,3}(.*?)_{1,3}"), "$1")
+        .replace(Regex("^>\\s?", RegexOption.MULTILINE), "")
+        .replace(Regex("^[-*_]{3,}\\s*$", RegexOption.MULTILINE), "")
+        .replace(Regex("^\\s*[-*+]\\s+", RegexOption.MULTILINE), "")
+        .replace(Regex("^\\s*\\d+\\.\\s+", RegexOption.MULTILINE), "")
+        .replace(Regex("<[^>]+>"), " ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+}
+
+private fun createSpeechRecognitionIntent(context: Context): Intent {
+    return Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+        putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+        putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
+        putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
+    }
+}
+
+private fun isSpeechRecognitionIntentAvailable(context: Context): Boolean {
+    return createSpeechRecognitionIntent(context).resolveActivity(context.packageManager) != null
+}
+
+private fun listSpeechRecognitionServices(context: Context): List<String> {
+    return try {
+        val queryIntent = Intent("android.speech.RecognitionService")
+        context.packageManager
+            .queryIntentServices(queryIntent, PackageManager.MATCH_ALL)
+            .mapNotNull { it.serviceInfo?.packageName }
+            .distinct()
+            .sorted()
+    } catch (_: Exception) {
+        emptyList()
+    }
+}
+
+private fun openVoiceInputSettings(context: Context): Boolean {
+    val settingsIntent = Intent(Settings.ACTION_VOICE_INPUT_SETTINGS).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    return try {
+        if (settingsIntent.resolveActivity(context.packageManager) == null) {
+            false
+        } else {
+            context.startActivity(settingsIntent)
+            true
+        }
+    } catch (_: Exception) {
+        false
+    }
+}
+
 private fun sanitizeKeyPart(value: String): String {
     return value.replace(Regex("[^A-Za-z0-9._-]"), "_")
 }
@@ -116,19 +366,53 @@ private fun chatHistoryPrefsKey(wsUrl: String, chatId: String): String {
 }
 
 private fun mergeChatMessages(existing: List<ChatMessage>, incoming: ChatMessage): List<ChatMessage> {
-    val matchKeys = buildSet<String> {
-        add(incoming.id)
-        incoming.clientMessageId?.let { add(it) }
+    val byIdIndex = existing.indexOfFirst { message ->
+        message.id == incoming.id
     }
-    val index = existing.indexOfFirst { message ->
-        message.id in matchKeys || (message.clientMessageId != null && message.clientMessageId in matchKeys)
+    if (byIdIndex >= 0) {
+        return existing.toMutableList().apply {
+            this[byIdIndex] = incoming
+        }.toList()
     }
+
+    val incomingClientMessageId = incoming.clientMessageId
+    val byClientMessageIdIndex = if (incomingClientMessageId.isNullOrBlank()) {
+        -1
+    } else {
+        existing.indexOfFirst { message ->
+            message.fromUser == incoming.fromUser &&
+                (message.clientMessageId == incomingClientMessageId || message.id == incomingClientMessageId)
+        }
+    }
+
+    val index = byClientMessageIdIndex
     return if (index >= 0) {
         existing.toMutableList().apply {
             this[index] = incoming
         }.toList()
     } else {
         existing + incoming
+    }
+}
+
+private fun mergeChatMessagesByAppendingContent(
+    existing: List<ChatMessage>,
+    incoming: ChatMessage,
+): List<ChatMessage> {
+    val index = existing.indexOfFirst { message ->
+        message.id == incoming.id
+    }
+    return if (index >= 0) {
+        existing.toMutableList().apply {
+            val current = this[index]
+            this[index] = current.copy(
+                content = current.content + incoming.content,
+                clientMessageId = incoming.clientMessageId ?: current.clientMessageId,
+                timestamp = incoming.timestamp,
+            )
+        }.toList()
+    } else {
+        mergeChatMessages(existing, incoming)
     }
 }
 
@@ -224,11 +508,74 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val gson = remember { Gson() }
-
+    val speechSpeaker = remember(context) { AndroidTtsSpeaker(context) }
     var messages by remember { mutableStateOf(listOf<ChatMessage>()) }
     var inputText by remember { mutableStateOf("") }
-    var client by remember { mutableStateOf<MyWebSocketClient?>(null) }
+    var pendingVoiceSendText by remember { mutableStateOf<String?>(null) }
     var connectionStatus by remember { mutableStateOf("未连接") }
+    var hasMicPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED,
+        )
+    }
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        contract = RequestPermission(),
+    ) { granted ->
+        hasMicPermission = granted
+        if (!granted) {
+            Log.e(TAG, "Microphone permission denied")
+            connectionStatus = "语音输入不可用：未授予麦克风权限"
+        }
+    }
+    val voiceInputLauncher = rememberLauncherForActivityResult(
+        contract = StartActivityForResult(),
+    ) { result ->
+        if (result.resultCode != Activity.RESULT_OK) {
+            Log.e(TAG, "System speech activity cancelled resultCode=${result.resultCode}")
+            return@rememberLauncherForActivityResult
+        }
+        val transcript = result.data
+            ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+            ?.firstOrNull()
+            ?.trim()
+            .orEmpty()
+        if (transcript.isNotBlank()) {
+            Log.d(TAG, "System speech activity transcript=$transcript")
+            inputText = transcript
+            pendingVoiceSendText = transcript
+        } else {
+            Log.w(TAG, "System speech activity returned empty transcript")
+        }
+    }
+    var speechInput by remember {
+        mutableStateOf<AndroidSpeechInput?>(null)
+    }
+    LaunchedEffect(hasMicPermission) {
+        if (hasMicPermission && speechInput == null) {
+            speechInput = AndroidSpeechInput(
+                context = context,
+                onPartialText = { transcript ->
+                    inputText = transcript
+                },
+                onFinalText = { transcript ->
+                    inputText = transcript
+                    pendingVoiceSendText = transcript
+                },
+                onError = { message ->
+                    connectionStatus = message
+                },
+            )
+            Log.d(
+                TAG,
+                "voice init: recognizerAvailable=${speechInput?.isAvailable() == true}, intentAvailable=${isSpeechRecognitionIntentAvailable(context)}, services=${listSpeechRecognitionServices(context)}",
+            )
+        }
+    }
+    val voiceInputAvailable = remember(hasMicPermission, speechInput) {
+        hasMicPermission
+    }
+
+    var client by remember { mutableStateOf<MyWebSocketClient?>(null) }
     var activeChatId by remember { mutableStateOf(DEFAULT_CHAT_ID) }
     var knownChatIds by remember { mutableStateOf(listOf(DEFAULT_CHAT_ID)) }
     var lastProcessedMsgId by remember { mutableStateOf<String?>(null) }
@@ -237,8 +584,63 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
     var reconnectEnabled by remember { mutableStateOf(true) }
     var reconnectJob by remember { mutableStateOf<Job?>(null) }
     var historyLoaded by remember { mutableStateOf(false) }
+    var speechEnabled by rememberSaveable { mutableStateOf(true) }
     val activeStreamMessageIds = remember { mutableStateMapOf<String, String>() }
     var connectSocket: () -> Unit = {}
+
+    DisposableEffect(speechSpeaker) {
+        onDispose {
+            speechSpeaker.shutdown()
+        }
+    }
+
+    DisposableEffect(speechInput) {
+        onDispose {
+            speechInput?.stop()
+            speechInput = null
+        }
+    }
+
+    fun startVoiceInput() {
+        if (!hasMicPermission) {
+            Log.e(TAG, "startVoiceInput: requesting RECORD_AUDIO permission")
+            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
+        val activeSpeechInput = speechInput
+        if (activeSpeechInput?.isAvailable() == true) {
+            try {
+                Log.d(TAG, "startVoiceInput: using SpeechRecognizer")
+                activeSpeechInput.startListening()
+                return
+            } catch (_: Exception) {
+                Log.e(TAG, "startVoiceInput: SpeechRecognizer threw exception")
+                connectionStatus = "语音输入不可用：语音识别服务未响应"
+                return
+            }
+        }
+        if (isSpeechRecognitionIntentAvailable(context)) {
+            try {
+                Log.d(TAG, "startVoiceInput: falling back to system speech activity")
+                voiceInputLauncher.launch(createSpeechRecognitionIntent(context))
+                return
+            } catch (_: Exception) {
+                Log.e(TAG, "startVoiceInput: failed to launch system speech activity")
+                connectionStatus = "语音输入不可用：无法打开系统语音识别界面"
+                return
+            }
+        }
+        Log.e(
+            TAG,
+            "startVoiceInput: no speech recognition provider available, recognizerAvailable=${activeSpeechInput?.isAvailable() == true}, intentAvailable=${isSpeechRecognitionIntentAvailable(context)}, services=${listSpeechRecognitionServices(context)}",
+        )
+        val openedSettings = openVoiceInputSettings(context)
+        connectionStatus = if (openedSettings) {
+            "语音输入不可用：未检测到识别服务，已为你打开语音输入设置"
+        } else {
+            "语音输入不可用：未检测到识别服务，请安装或启用系统语音识别"
+        }
+    }
 
     fun persistKnownChats() {
         ChatHistoryStore.saveKnownChatIds(context, wsUrl, knownChatIds)
@@ -248,6 +650,53 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
         if (historyLoaded) {
             ChatHistoryStore.saveMessages(context, wsUrl, activeChatId, messages)
         }
+    }
+
+    fun sendUserMessage(text: String): Boolean {
+        val currentClient = client
+        val trimmed = text.trim()
+        if (trimmed.isBlank() || currentClient?.isOpen != true) {
+            return false
+        }
+        val clientMessageId = UUID.randomUUID().toString()
+        val optimisticMessage = ChatMessage(
+            content = trimmed,
+            fromUser = true,
+            id = clientMessageId,
+            clientMessageId = clientMessageId,
+        )
+        messages = mergeChatMessages(messages, optimisticMessage)
+        ChatHistoryStore.appendMessage(context, wsUrl, activeChatId, optimisticMessage)
+        persistCurrentMessages()
+
+        val outgoing = mapOf(
+            "type" to "simulate_user_message",
+            "user_id" to DEFAULT_USER_ID,
+            "chat_id" to activeChatId,
+            "client_message_id" to clientMessageId,
+            "content" to trimmed,
+        )
+        scope.launch(Dispatchers.IO) {
+            try {
+                currentClient.send(gson.toJson(outgoing))
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+        return true
+    }
+
+    LaunchedEffect(pendingVoiceSendText, client, activeChatId) {
+        val transcript = pendingVoiceSendText?.trim().orEmpty()
+        if (transcript.isBlank()) {
+            return@LaunchedEffect
+        }
+        if (sendUserMessage(transcript)) {
+            pendingVoiceSendText = null
+            inputText = ""
+            return@LaunchedEffect
+        }
+        connectionStatus = "语音识别已完成，但当前未连接，未能自动发送"
     }
 
     fun rememberChat(chatId: String) {
@@ -287,15 +736,29 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
         }
     }
 
-    fun mergeIncomingMessage(chatId: String?, incoming: ChatMessage) {
+    fun mergeIncomingMessage(
+        chatId: String?,
+        incoming: ChatMessage,
+        appendToExistingContent: Boolean = false,
+    ) {
         val normalizedChatId = chatId?.trim().orEmpty()
         if (normalizedChatId.isNotBlank()) {
             rememberChat(normalizedChatId)
-            ChatHistoryStore.appendMessage(context, wsUrl, normalizedChatId, incoming)
+            val persistedMessages = ChatHistoryStore.loadMessages(context, wsUrl, normalizedChatId)
+            val mergedPersisted = if (appendToExistingContent) {
+                mergeChatMessagesByAppendingContent(persistedMessages, incoming)
+            } else {
+                mergeChatMessages(persistedMessages, incoming)
+            }
+            ChatHistoryStore.saveMessages(context, wsUrl, normalizedChatId, mergedPersisted)
             persistKnownChats()
         }
         if (normalizedChatId.isBlank() || normalizedChatId == activeChatId) {
-            messages = mergeChatMessages(messages, incoming)
+            messages = if (appendToExistingContent) {
+                mergeChatMessagesByAppendingContent(messages, incoming)
+            } else {
+                mergeChatMessages(messages, incoming)
+            }
         }
     }
 
@@ -415,6 +878,11 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                                                 clientMessageId = clientMessageId,
                                             ),
                                         )
+                                        if (speechEnabled && content.isNotBlank()) {
+                                            scope.launch {
+                                                speechSpeaker.speak(content)
+                                            }
+                                        }
                                         lastProcessedMsgId = messageId
                                     }
 
@@ -454,6 +922,7 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                                                         id = streamMessageId,
                                                         clientMessageId = clientMessageId,
                                                     ),
+                                                    appendToExistingContent = true,
                                                 )
                                             }
 
@@ -469,6 +938,11 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                                                         clientMessageId = clientMessageId,
                                                     ),
                                                 )
+                                                if (speechEnabled && content.isNotBlank()) {
+                                                    scope.launch {
+                                                        speechSpeaker.speak(content)
+                                                    }
+                                                }
                                                 activeStreamMessageIds.remove(streamKey)
                                                 lastProcessedMsgId = finalMessageId
                                             }
@@ -647,6 +1121,12 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                 horizontalArrangement = Arrangement.End,
             ) {
                 OutlinedButton(
+                    onClick = { speechEnabled = !speechEnabled },
+                ) {
+                    Text(if (speechEnabled) "语音播报: 开" else "语音播报: 关")
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                OutlinedButton(
                     onClick = {
                         if (client?.isOpen == true) {
                             scope.launch(Dispatchers.IO) {
@@ -691,38 +1171,18 @@ fun ChatScreen(wsUrl: String, onSettingsClick: () -> Unit) {
                     modifier = Modifier.weight(1f),
                     placeholder = { Text("Type a message...") },
                 )
+                Spacer(modifier = Modifier.width(8.dp))
+                OutlinedButton(
+                    onClick = { startVoiceInput() },
+                    enabled = voiceInputAvailable,
+                ) {
+                    Text(if (voiceInputAvailable) "语音输入" else "语音输入不可用")
+                }
+                Spacer(modifier = Modifier.width(8.dp))
                 IconButton(
                     onClick = {
-                        val currentClient = client
-                        val trimmed = inputText.trim()
-                        if (trimmed.isBlank() || currentClient?.isOpen != true) {
-                            return@IconButton
-                        }
-                        val clientMessageId = UUID.randomUUID().toString()
-                        inputText = ""
-                        val optimisticMessage = ChatMessage(
-                            content = trimmed,
-                            fromUser = true,
-                            id = clientMessageId,
-                            clientMessageId = clientMessageId,
-                        )
-                        messages = mergeChatMessages(messages, optimisticMessage)
-                        ChatHistoryStore.appendMessage(context, wsUrl, activeChatId, optimisticMessage)
-                        persistCurrentMessages()
-
-                        val outgoing = mapOf(
-                            "type" to "simulate_user_message",
-                            "user_id" to DEFAULT_USER_ID,
-                            "chat_id" to activeChatId,
-                            "client_message_id" to clientMessageId,
-                            "content" to trimmed,
-                        )
-                        scope.launch(Dispatchers.IO) {
-                            try {
-                                currentClient.send(gson.toJson(outgoing))
-                            } catch (e: Exception) {
-                                e.printStackTrace()
-                            }
+                        if (sendUserMessage(inputText)) {
+                            inputText = ""
                         }
                     },
                 ) {
