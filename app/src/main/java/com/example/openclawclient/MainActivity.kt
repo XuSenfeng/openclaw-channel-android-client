@@ -79,15 +79,19 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.java_websocket.client.WebSocketClient
 import org.java_websocket.handshake.ServerHandshake
 import java.net.URI
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 private const val DEFAULT_USER_ID = "user001"
 private const val DEFAULT_SERVER_ID = "default"
 private const val DEFAULT_WS_URL = "ws://192.168.0.8:8765"
+private const val DEFAULT_NICKNAME = "手机用户"
 private const val DEFAULT_CHAT_ID = "default_chat"
 private const val PREFS_NAME = "openclaw_client_state"
 private const val ACTIVE_CHAT_PREFIX = "active_chat_"
@@ -106,21 +110,48 @@ data class ClientSettings(
     val wsUrl: String,
     val serverId: String,
     val userId: String,
+    val pairToken: String,
+    val nickname: String,
+    val deviceId: String,
+)
+
+private data class PairingResult(
+    val success: Boolean,
+    val wsUrl: String,
+    val serverId: String,
+    val accountId: String,
+    val pairToken: String,
+    val nickname: String,
+    val error: String? = null,
 )
 
 object ClientSettingsStore {
     private const val KEY_WS_URL = "settings_ws_url"
     private const val KEY_SERVER_ID = "settings_server_id"
     private const val KEY_USER_ID = "settings_user_id"
+    private const val KEY_PAIR_TOKEN = "settings_pair_token"
+    private const val KEY_NICKNAME = "settings_nickname"
+    private const val KEY_DEVICE_ID = "settings_device_id"
 
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     fun load(context: Context): ClientSettings {
         val store = prefs(context)
+        val deviceId = store.getString(KEY_DEVICE_ID, null)?.trim().orEmpty().ifBlank {
+            UUID.randomUUID().toString()
+        }
+        if (store.getString(KEY_DEVICE_ID, null).isNullOrBlank()) {
+            store.edit().putString(KEY_DEVICE_ID, deviceId).apply()
+        }
         return ClientSettings(
             wsUrl = store.getString(KEY_WS_URL, DEFAULT_WS_URL)?.trim().orEmpty().ifBlank { DEFAULT_WS_URL },
             serverId = store.getString(KEY_SERVER_ID, DEFAULT_SERVER_ID)?.trim().orEmpty().ifBlank { DEFAULT_SERVER_ID },
-            userId = store.getString(KEY_USER_ID, DEFAULT_USER_ID)?.trim().orEmpty().ifBlank { DEFAULT_USER_ID },
+            userId = store.getString(KEY_USER_ID, "")?.trim().orEmpty(),
+            pairToken = store.getString(KEY_PAIR_TOKEN, "")?.trim().orEmpty(),
+            nickname = store.getString(KEY_NICKNAME, DEFAULT_NICKNAME)?.trim().orEmpty().ifBlank {
+                DEFAULT_NICKNAME
+            },
+            deviceId = deviceId,
         )
     }
 
@@ -129,7 +160,21 @@ object ClientSettingsStore {
             .putString(KEY_WS_URL, settings.wsUrl)
             .putString(KEY_SERVER_ID, settings.serverId)
             .putString(KEY_USER_ID, settings.userId)
+            .putString(KEY_PAIR_TOKEN, settings.pairToken)
+            .putString(KEY_NICKNAME, settings.nickname)
+            .putString(KEY_DEVICE_ID, settings.deviceId)
             .apply()
+    }
+
+    fun clearPairing(context: Context) {
+        val current = load(context)
+        save(
+            context,
+            current.copy(
+                userId = "",
+                pairToken = "",
+            ),
+        )
     }
 }
 
@@ -518,6 +563,138 @@ private object ChatHistoryStore {
     }
 }
 
+private fun requestPairing(
+    wsUrl: String,
+    pairCode: String,
+    nickname: String,
+    deviceId: String,
+): PairingResult {
+    val trimmedUrl = wsUrl.trim()
+    val trimmedCode = pairCode.trim()
+    if (trimmedUrl.isBlank() || trimmedCode.isBlank()) {
+        return PairingResult(
+            success = false,
+            wsUrl = trimmedUrl,
+            serverId = "",
+            accountId = "",
+            pairToken = "",
+            nickname = nickname,
+            error = "请输入配对码",
+        )
+    }
+
+    val gson = Gson()
+    val resultSignal = CountDownLatch(1)
+    var result = PairingResult(
+        success = false,
+        wsUrl = trimmedUrl,
+        serverId = "",
+        accountId = "",
+        pairToken = "",
+        nickname = nickname,
+        error = "配对失败",
+    )
+
+    val client = object : WebSocketClient(URI(trimmedUrl)) {
+        override fun onOpen(handshakedata: ServerHandshake?) {
+            try {
+                send(
+                    gson.toJson(
+                        mapOf(
+                            "type" to "pair_with_code",
+                            "pair_code" to trimmedCode,
+                            "nickname" to nickname.trim().ifBlank { DEFAULT_NICKNAME },
+                            "device_id" to deviceId,
+                        ),
+                    ),
+                )
+            } catch (e: Exception) {
+                result = result.copy(error = e.message ?: "发送配对请求失败")
+                resultSignal.countDown()
+            }
+        }
+
+        override fun onMessage(message: String?) {
+            if (message.isNullOrBlank()) {
+                return
+            }
+            try {
+                @Suppress("UNCHECKED_CAST")
+                val payload = gson.fromJson(message, Map::class.java) as? Map<String, Any?> ?: return
+                when (payload["type"] as? String) {
+                    "pair_with_code_response" -> {
+                        val status = payload["status"] as? String
+                        if (status == "success") {
+                            val nextWsUrl = (payload["ws_url"] as? String)?.trim().orEmpty().ifBlank {
+                                trimmedUrl
+                            }
+                            val nextServerId = (payload["server_id"] as? String)?.trim().orEmpty()
+                            val accountId = ((payload["account_id"] as? String)
+                                ?: (payload["user_id"] as? String)).orEmpty().trim()
+                            val pairToken = (payload["pair_token"] as? String)?.trim().orEmpty()
+                            val pairedNickname = (payload["nickname"] as? String)?.trim().orEmpty()
+                                .ifBlank { nickname.trim().ifBlank { DEFAULT_NICKNAME } }
+                            result = PairingResult(
+                                success = nextServerId.isNotBlank() && accountId.isNotBlank() && pairToken.isNotBlank(),
+                                wsUrl = nextWsUrl,
+                                serverId = nextServerId,
+                                accountId = accountId,
+                                pairToken = pairToken,
+                                nickname = pairedNickname,
+                                error = if (
+                                    nextServerId.isNotBlank() && accountId.isNotBlank() && pairToken.isNotBlank()
+                                ) {
+                                    null
+                                } else {
+                                    "服务端返回的配对信息不完整"
+                                },
+                            )
+                        } else {
+                            result = result.copy(error = payload["error"] as? String ?: "配对码无效或已过期")
+                        }
+                        resultSignal.countDown()
+                    }
+
+                    "error" -> {
+                        result = result.copy(error = payload["error"] as? String ?: "配对失败")
+                        resultSignal.countDown()
+                    }
+                }
+            } catch (_: Exception) {
+                result = result.copy(error = "配对响应解析失败")
+                resultSignal.countDown()
+            }
+        }
+
+        override fun onClose(code: Int, reason: String?, remote: Boolean) {
+            if (resultSignal.count > 0) {
+                result = result.copy(error = reason ?: "连接已关闭")
+                resultSignal.countDown()
+            }
+        }
+
+        override fun onError(ex: Exception?) {
+            result = result.copy(error = ex?.message ?: "连接失败")
+            resultSignal.countDown()
+        }
+    }
+
+    return try {
+        if (!client.connectBlocking(8, TimeUnit.SECONDS)) {
+            return result.copy(error = "无法连接到配对服务")
+        }
+        resultSignal.await(8, TimeUnit.SECONDS)
+        result
+    } catch (e: Exception) {
+        result.copy(error = e.message ?: "配对失败")
+    } finally {
+        try {
+            client.closeBlocking()
+        } catch (_: Exception) {
+        }
+    }
+}
+
 @Composable
 fun AppNavigation() {
     val context = LocalContext.current
@@ -526,6 +703,9 @@ fun AppNavigation() {
     var wsUrl by rememberSaveable { mutableStateOf(initialSettings.wsUrl) }
     var serverId by rememberSaveable { mutableStateOf(initialSettings.serverId) }
     var userId by rememberSaveable { mutableStateOf(initialSettings.userId) }
+    var pairToken by rememberSaveable { mutableStateOf(initialSettings.pairToken) }
+    var nickname by rememberSaveable { mutableStateOf(initialSettings.nickname) }
+    var deviceId by rememberSaveable { mutableStateOf(initialSettings.deviceId) }
 
     NavHost(navController = navController, startDestination = "chat") {
         composable("chat") {
@@ -533,6 +713,18 @@ fun AppNavigation() {
                 wsUrl = wsUrl,
                 serverId = serverId,
                 userId = userId,
+                pairToken = pairToken,
+                nickname = nickname,
+                deviceId = deviceId,
+                onPaired = { next ->
+                    wsUrl = next.wsUrl
+                    serverId = next.serverId
+                    userId = next.userId
+                    pairToken = next.pairToken
+                    nickname = next.nickname
+                    deviceId = next.deviceId
+                    ClientSettingsStore.save(context, next)
+                },
                 onSettingsClick = { navController.navigate("settings") },
             )
         }
@@ -541,11 +733,27 @@ fun AppNavigation() {
                 wsUrl = wsUrl,
                 serverId = serverId,
                 userId = userId,
+                pairToken = pairToken,
+                nickname = nickname,
+                deviceId = deviceId,
                 onSave = { next ->
                     wsUrl = next.wsUrl
                     serverId = next.serverId
                     userId = next.userId
+                    pairToken = next.pairToken
+                    nickname = next.nickname
+                    deviceId = next.deviceId
                     ClientSettingsStore.save(context, next)
+                },
+                onResetPairing = {
+                    ClientSettingsStore.clearPairing(context)
+                    val refreshed = ClientSettingsStore.load(context)
+                    wsUrl = refreshed.wsUrl
+                    serverId = refreshed.serverId
+                    userId = refreshed.userId
+                    pairToken = refreshed.pairToken
+                    nickname = refreshed.nickname
+                    deviceId = refreshed.deviceId
                 },
                 onBack = { navController.popBackStack() },
             )
@@ -555,7 +763,16 @@ fun AppNavigation() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ChatScreen(wsUrl: String, serverId: String, userId: String, onSettingsClick: () -> Unit) {
+fun ChatScreen(
+    wsUrl: String,
+    serverId: String,
+    userId: String,
+    pairToken: String,
+    nickname: String,
+    deviceId: String,
+    onPaired: (ClientSettings) -> Unit,
+    onSettingsClick: () -> Unit,
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val gson = remember { Gson() }
@@ -563,7 +780,19 @@ fun ChatScreen(wsUrl: String, serverId: String, userId: String, onSettingsClick:
     var messages by remember { mutableStateOf(listOf<ChatMessage>()) }
     var inputText by remember { mutableStateOf("") }
     var pendingVoiceSendText by remember { mutableStateOf<String?>(null) }
-    var connectionStatus by remember { mutableStateOf("未连接") }
+    val isBound = pairToken.isNotBlank() && userId.isNotBlank() && serverId.isNotBlank()
+    var connectionStatus by remember { mutableStateOf(if (isBound) "未连接" else "未配对") }
+    var pairingExpanded by remember { mutableStateOf(false) }
+    var pairingCode by remember { mutableStateOf("") }
+    var pairingNickname by remember { mutableStateOf(nickname.ifBlank { DEFAULT_NICKNAME }) }
+    var pairingWsUrl by remember { mutableStateOf(wsUrl) }
+    var pairingInProgress by remember { mutableStateOf(false) }
+    LaunchedEffect(nickname) {
+        pairingNickname = nickname.ifBlank { DEFAULT_NICKNAME }
+    }
+    LaunchedEffect(wsUrl) {
+        pairingWsUrl = wsUrl
+    }
     var hasMicPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED,
@@ -871,14 +1100,17 @@ fun ChatScreen(wsUrl: String, serverId: String, userId: String, onSettingsClick:
     }
 
     connectSocket = {
-        val uri = try {
-            URI(wsUrl)
-        } catch (_: Exception) {
-            connectionStatus = "地址无效"
-            null
-        }
+        if (!isBound) {
+            connectionStatus = "未配对"
+        } else {
+            val uri = try {
+                URI(wsUrl)
+            } catch (_: Exception) {
+                connectionStatus = "地址无效"
+                null
+            }
 
-        if (uri != null) {
+            if (uri != null) {
             reconnectEnabled = true
             reconnectJob?.cancel()
             reconnectJob = null
@@ -1080,6 +1312,10 @@ fun ChatScreen(wsUrl: String, serverId: String, userId: String, onSettingsClick:
                                     "role" to "client",
                                     "server_id" to serverId,
                                     "user_id" to userId,
+                                    "account_id" to userId,
+                                    "pair_token" to pairToken,
+                                    "device_id" to deviceId,
+                                    "user_name" to pairingNickname.trim().ifBlank { DEFAULT_NICKNAME },
                                 ),
                             )
                             scope.launch(Dispatchers.IO) {
@@ -1127,10 +1363,23 @@ fun ChatScreen(wsUrl: String, serverId: String, userId: String, onSettingsClick:
                     }
                 }
             }
+            }
         }
     }
 
-    LaunchedEffect(wsUrl, serverId, userId) {
+    LaunchedEffect(wsUrl, serverId, userId, pairToken) {
+        if (!isBound) {
+            reconnectEnabled = false
+            reconnectAttempt = 0
+            paired = false
+            historyLoaded = false
+            reconnectJob?.cancel()
+            reconnectJob = null
+            client?.close()
+            client = null
+            connectionStatus = "未配对"
+            return@LaunchedEffect
+        }
         reconnectEnabled = true
         reconnectAttempt = 0
         paired = false
@@ -1187,6 +1436,101 @@ fun ChatScreen(wsUrl: String, serverId: String, userId: String, onSettingsClick:
             )
         },
     ) { padding ->
+        if (!isBound) {
+            Column(
+                modifier = Modifier
+                    .padding(padding)
+                    .fillMaxSize()
+                    .padding(16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                Text("首次使用", style = MaterialTheme.typography.titleMedium)
+                Spacer(modifier = Modifier.height(10.dp))
+                Text("手机首次打开只需要一键配对", style = MaterialTheme.typography.bodyMedium)
+                Spacer(modifier = Modifier.height(20.dp))
+                Button(
+                    onClick = { pairingExpanded = true },
+                    enabled = !pairingInProgress,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(if (pairingInProgress) "配对中..." else "一键配对")
+                }
+                if (pairingExpanded) {
+                    Spacer(modifier = Modifier.height(16.dp))
+                    TextField(
+                        value = pairingWsUrl,
+                        onValueChange = { pairingWsUrl = it },
+                        label = { Text("服务地址 WebSocket URL") },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    TextField(
+                        value = pairingCode,
+                        onValueChange = { pairingCode = it.filter { ch -> ch.isDigit() }.take(6) },
+                        label = { Text("输入 6 位配对码") },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    TextField(
+                        value = pairingNickname,
+                        onValueChange = { pairingNickname = it },
+                        label = { Text("昵称（仅展示）") },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Button(
+                        onClick = {
+                            val code = pairingCode.trim()
+                            if (code.length != 6) {
+                                connectionStatus = "请输入 6 位配对码"
+                                return@Button
+                            }
+                            pairingInProgress = true
+                            scope.launch {
+                                val result = withContext(Dispatchers.IO) {
+                                    requestPairing(
+                                        wsUrl = pairingWsUrl,
+                                        pairCode = code,
+                                        nickname = pairingNickname,
+                                        deviceId = deviceId,
+                                    )
+                                }
+                                pairingInProgress = false
+                                if (!result.success) {
+                                    connectionStatus = result.error ?: "配对失败"
+                                    return@launch
+                                }
+                                pairingCode = ""
+                                pairingExpanded = false
+                                connectionStatus = "配对成功，连接中..."
+                                onPaired(
+                                    ClientSettings(
+                                        wsUrl = result.wsUrl,
+                                        serverId = result.serverId,
+                                        userId = result.accountId,
+                                        pairToken = result.pairToken,
+                                        nickname = result.nickname,
+                                        deviceId = deviceId,
+                                    ),
+                                )
+                            }
+                        },
+                        enabled = !pairingInProgress,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("确认配对")
+                    }
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    text = "状态: $connectionStatus",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            return@Scaffold
+        }
+
         Column(modifier = Modifier.padding(padding).fillMaxSize()) {
             Text(
                 text = "连接状态: $connectionStatus",
@@ -1196,7 +1540,7 @@ fun ChatScreen(wsUrl: String, serverId: String, userId: String, onSettingsClick:
                 style = MaterialTheme.typography.bodyMedium,
             )
             Text(
-                text = "目标: $serverId / $userId",
+                text = "目标: $serverId / $userId (${pairingNickname.ifBlank { DEFAULT_NICKNAME }})",
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 12.dp, vertical = 2.dp),
@@ -1721,12 +2065,15 @@ fun SettingsScreen(
     wsUrl: String,
     serverId: String,
     userId: String,
+    pairToken: String,
+    nickname: String,
+    deviceId: String,
     onSave: (ClientSettings) -> Unit,
+    onResetPairing: () -> Unit,
     onBack: () -> Unit,
 ) {
     var tempUrl by remember { mutableStateOf(wsUrl) }
-    var tempServerId by remember { mutableStateOf(serverId) }
-    var tempUserId by remember { mutableStateOf(userId) }
+    var tempNickname by remember { mutableStateOf(nickname.ifBlank { DEFAULT_NICKNAME }) }
 
     Scaffold(
         topBar = {
@@ -1742,26 +2089,29 @@ fun SettingsScreen(
             )
             Spacer(modifier = Modifier.height(16.dp))
             TextField(
-                value = tempServerId,
-                onValueChange = { tempServerId = it },
-                label = { Text("Server ID") },
+                value = tempNickname,
+                onValueChange = { tempNickname = it },
+                label = { Text("Nickname") },
                 modifier = Modifier.fillMaxWidth(),
             )
             Spacer(modifier = Modifier.height(16.dp))
-            TextField(
-                value = tempUserId,
-                onValueChange = { tempUserId = it },
-                label = { Text("User ID") },
-                modifier = Modifier.fillMaxWidth(),
+            Text("Server ID: $serverId", style = MaterialTheme.typography.bodySmall)
+            Text("Account ID: ${if (userId.isBlank()) "未配对" else userId}", style = MaterialTheme.typography.bodySmall)
+            Text(
+                "Pair Token: ${if (pairToken.isBlank()) "未配对" else "已绑定"}",
+                style = MaterialTheme.typography.bodySmall,
             )
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(20.dp))
             Button(
                 onClick = {
                     onSave(
                         ClientSettings(
                             wsUrl = tempUrl.trim().ifBlank { DEFAULT_WS_URL },
-                            serverId = tempServerId.trim().ifBlank { DEFAULT_SERVER_ID },
-                            userId = tempUserId.trim().ifBlank { DEFAULT_USER_ID },
+                            serverId = serverId,
+                            userId = userId,
+                            pairToken = pairToken,
+                            nickname = tempNickname.trim().ifBlank { DEFAULT_NICKNAME },
+                            deviceId = deviceId,
                         ),
                     )
                     onBack()
@@ -1769,6 +2119,16 @@ fun SettingsScreen(
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text("Save & Back")
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+            OutlinedButton(
+                onClick = {
+                    onResetPairing()
+                    onBack()
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("重置配对")
             }
         }
     }
